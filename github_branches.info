@@ -1,0 +1,5 @@
+type = module
+name = GitHub Branches
+description = View the branches for a GitHub fork and the pull requests associated with them.
+backdrop = 1.x
+configure = admin/reports/github_branches

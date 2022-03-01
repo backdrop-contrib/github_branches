@@ -1,0 +1,294 @@
+<?php
+/**
+ * @file
+ * View the branches for a GitHub fork and the pull requests associated with
+ * them.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function github_branches_menu() {
+  return array(
+    'admin/reports/github_branches' => array(
+      'title' => 'GitHub branches',
+      'description' => 'View the branches for a GitHub fork and the pull requests associated with them.',
+      'page callback' => 'backdrop_get_form',
+      'page arguments' => array('github_branches_form'),
+      'access arguments' => array('access github branches'),
+    ),
+    'admin/reports/github_branches/clear' => array(
+      'title' => 'Clear branch info',
+      'page callback' => 'github_branches_clear',
+      'access arguments' => array('access github branches'),
+      'type' => MENU_CALLBACK,
+    ),
+  );
+}
+
+/**
+ * Implements hook_permission().
+ */
+function github_branches_permission() {
+  return array(
+    'access github branches' => array(
+      'title' => t('Access GitHub branches'),
+    ),
+  );
+}
+
+/**
+ * Page callback: Constructs a form for generating a list of GitHub branches.
+ *
+ * @see github_branches_menu()
+ */
+function github_branches_form($form, &$form_state) {
+  // Form elements.
+  $form['repo'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Repository'),
+    '#description' => t("The repository to retrieve a list of branches from. Must be a fork of another repository. E.g.: 'backdrop-ops/backdrop-composer'."),
+    '#default_value' => config_get('github_branches.form', 'repo'),
+    '#placeholder' => t('owner/repository'),
+    '#required' => TRUE,
+    '#maxlength' => 255,
+    '#size' => 30,
+  );
+  $form['bypass'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Bypass cache'),
+    '#description' => t("By default, results are cached in <code>.json</code> files to avoid making too many API calls. Enable this option to bypass the cache and get up-to-date data directly from the API."),
+    '#default_value' => FALSE,
+  );
+
+  // Form buttons.
+  $form['actions'] = array(
+    '#type' => 'actions',
+    'submit' => array(
+      '#type' => 'submit',
+      '#value' => t('Get branches'),
+    ),
+    'clear' => array(
+      '#type' => 'link',
+      '#title' => t('Clear'),
+      '#href' => 'admin/reports/github_branches/clear',
+    ),
+  );
+
+  // Results table.
+  $header = array(
+    array('data' => t('Branch'), 'field' => 'branch', 'sort' => 'asc'),
+    array('data' => t('PR'), 'field' => 'pr'),
+    array('data' => t('Status'), 'field' => 'status'),
+    array('data' => t('Updated'), 'field' => 'updated'),
+  );
+  $rows = array();
+  if (isset($_SESSION['github_branches_table_rows'])) {
+    $rows = $_SESSION['github_branches_table_rows'];
+    $ts = tablesort_init($header);
+    backdrop_sort($rows, array($ts['sql'] => SORT_STRING), ($ts['sort'] == 'asc') ? SORT_ASC : SORT_DESC);
+  }
+  $form['table'] = array(
+    '#theme' => 'table',
+    '#header' => $header,
+    '#rows' => $rows,
+    '#empty' => t('Submit the form above to display branch information.'),
+    '#weight' => 999,
+  );
+
+  return $form;
+}
+
+/**
+ * Form validation handler for github_branches_form().
+ */
+function github_branches_form_validate($form, &$form_state) {
+  $values = $form_state['values'];
+
+  // Make sure the repo includes a '/'.
+  if (strpos($values['repo'], '/') === FALSE) {
+    form_set_error('repo', t("%field must include the owner. Please use the format: 'owner/repository'.", array('%field' => t('Repository'))));
+    return;
+  }
+
+  // Make sure the repo exists.
+  $repo = github_branches_api('repos/' . $values['repo'], $values['bypass']);
+  if (isset($repo['message']) && $repo['message'] == 'Not Found') {
+    form_set_error('repo', t("The %repo repository cannot be found.", array('%repo' => $values['repo'])));
+    return;
+  }
+
+  // Make sure the repo is a fork (i.e. it has a parent).
+  if (empty($repo['parent'])) {
+    form_set_error('repo', t("%field must be a fork. %repo doesn't have a parent repository.", array('%field' => t('Repository'), '%repo' => $values['repo'])));
+    return;
+  }
+}
+
+/**
+ * Form submission handler for github_branches_form().
+ */
+function github_branches_form_submit($form, &$form_state) {
+  $_SESSION['github_branches_table_rows'] = array();
+  $per_page = 100;
+
+  // Save the form values. We don't save the 'Bypass cache' checkbox though.
+  $values = $form_state['values'];
+  config_set('github_branches.form', 'repo', $values['repo']);
+
+  // Get the repo and owner.
+  $repo = github_branches_api('repos/' . $values['repo'], $values['bypass']);
+  $owner = strtolower(strstr($values['repo'], '/', TRUE));
+
+  // Get all branches from the repo.
+  $branches = array();
+  $page_no = 1;
+  do {
+    $response = github_branches_api('repos/' . $values['repo'] . '/branches?per_page=' . $per_page . '&page=' . $page_no, $values['bypass']);
+    $branches = array_merge($branches, array_column($response, 'name'));
+    $page_no++;
+  }
+  while (count($response) == $per_page);
+
+  // Get all branches from the parent repo.
+  $parent_branches = array();
+  $page_no = 1;
+  do {
+    $response = github_branches_api('repos/' . $repo['parent']['full_name'] . '/branches?per_page=' . $per_page . '&page=' . $page_no, $values['bypass']);
+    $parent_branches = array_merge($parent_branches, array_column($response, 'name'));
+    $page_no++;
+  }
+  while (count($response) == $per_page);
+
+  // Remove parent branches from the repo branches.
+  foreach ($branches as $id => $branch) {
+    if (in_array($branch, $parent_branches)) {
+      unset($branches[$id]);
+    }
+  }
+
+  // Get pull requests from the parent repo.
+  $parent_pulls = $parent_pulls_branches = array();
+  $page_no = 1;
+  do {
+    $response = github_branches_api('repos/' . $repo['parent']['full_name'] . '/pulls?state=all&per_page=' . $per_page . '&page=' . $page_no, $values['bypass']);
+    foreach ($response as $pull) {
+      // Ignore pull requests without a head branch.
+      if (!isset($pull['head']['label'])) {
+        continue;
+      }
+
+      // Get the branch owner.
+      $branch_parts = explode(':', $pull['head']['label']);
+      $branch_owner = strtolower($branch_parts[0]);
+
+      // Ignore pull requests by other users or without a proper branch.
+      if (($branch_owner != $owner) || !isset($branch_parts[1])) {
+        continue;
+      }
+
+      // Add to array.
+      $parent_pulls[$pull['number']] = array(
+        'url' => $pull['html_url'],
+        'status' => $pull['state'],
+        'branch' => $branch_parts[1],
+        'updated' => $pull['updated_at'],
+      );
+
+      // We need another array for searching for branches.
+      $parent_pulls_branches[$pull['number']] = $branch_parts[1];
+    }
+    $page_no++;
+  }
+  while (count($response) == $per_page);
+
+  // Populate the table rows.
+  foreach ($branches as $branch) {
+    $branch_link = l($branch, $repo['html_url'] . '/tree/' . rawurlencode($branch));
+    $pr = $status = $updated = '-';
+
+    // Get all pull requests associated with the branch.
+    if (!empty($pulls = array_keys($parent_pulls_branches, $branch))) {
+      $pull_data = array();
+      foreach ($pulls as $pull) {
+        $pull_data['links'][] = l('#' . $pull, $parent_pulls[$pull]['url']);
+        $pull_data['statuses'][] = $parent_pulls[$pull]['status'];
+        $pull_data['updated'][] = format_date(strtotime($parent_pulls[$pull]['updated']), 'custom', 'Y.m.d-H:i');
+      }
+
+      $pr = implode('<br>', $pull_data['links']);
+      $status = implode('<br>', $pull_data['statuses']);
+      $updated = implode('<br>', $pull_data['updated']);
+    }
+
+    // Add to the table.
+    $_SESSION['github_branches_table_rows'][] = array(
+      'branch' => $branch_link,
+      'pr' => $pr,
+      'status' => $status,
+      'updated' => $updated,
+    );
+  }
+}
+
+/**
+ * Page callback: Clear branch information.
+ *
+ * @see github_branches_menu()
+ */
+function github_branches_clear() {
+  // Clear the session data.
+  $_SESSION['github_branches_table_rows'] = array();
+
+  // Reload the form.
+  backdrop_goto('admin/reports/github_branches');
+}
+
+/**
+ * Call the GitHub API.
+ *
+ * @param string $path
+ *   The part of the API endpoint that's appended to `https://api.github.com/`.
+ * @param bool $bypass_cache
+ *   Get results from the API rather than the cached .json files. Defaults to
+ *   FALSE.
+ *
+ * @return array
+ *   The response from the API query.
+ */
+function github_branches_api($path, $bypass_cache = FALSE) {
+  $directory = 'public://github_branches';
+  $file = $directory . '/' . backdrop_html_class($path) . '.json';
+
+  // Create the directory if it doesn't already exist.
+  if (!is_dir($directory)) {
+    mkdir($directory, 0775);
+  }
+
+  if (!$bypass_cache && file_exists($file)) {
+    // Get the cached response.
+    $response = file_get_contents($file);
+  }
+  else {
+    // Make an API call.
+    $ch = curl_init('https://api.github.com/' . $path);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+      'User-Agent: GitHub branches',
+      'Accept: application/vnd.github.v3+json',
+    ));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+    $response = curl_exec($ch);
+    curl_close($ch);
+
+    // Show error when API rate limit reached.
+    if (strpos($response, 'API rate limit exceeded') !== FALSE) {
+      backdrop_set_message('GitHub API rate limit exceeded.', 'error');
+      return;
+    }
+
+    // Cache the response for future.
+    file_put_contents($file, $response);
+  }
+
+  return json_decode($response, TRUE);
+}
