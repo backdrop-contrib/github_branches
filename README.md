@@ -24,7 +24,7 @@ https://github.com/backdrop-contrib/github_branches/issues.
 Current Maintainers
 -------------------
 
-- [Peter Anderson](https://github.com/BWPanda)
+- Seeking maintainer(s)
 
 Credits
 -------
